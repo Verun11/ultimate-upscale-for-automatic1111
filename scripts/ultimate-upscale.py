@@ -22,10 +22,10 @@ class USDUSFMode(Enum):
 
 class USDUpscaler():
 
-    def __init__(self, p, image, upscaler_index:int, save_redraw, save_seams_fix, tile_width, tile_height) -> None:
+    def __init__(self, p, image, upscaler_index:int, save_redraw, save_seams_fix, tile_width, tile_height, tiling_mode) -> None:
         self.p:StableDiffusionProcessing = p
         self.image:Image = image
-        self.scale_factor = math.ceil(max(p.width, p.height) / max(image.width, image.height))
+        self.tiling_mode = tiling_mode
         self.upscaler = shared.sd_upscalers[upscaler_index]
         self.redraw = USDURedraw()
         self.redraw.save = save_redraw
@@ -36,8 +36,21 @@ class USDUpscaler():
         self.seams_fix.tile_width = tile_width if tile_width > 0 else tile_height
         self.seams_fix.tile_height = tile_height if tile_height > 0 else tile_width
         self.initial_info = None
-        self.rows = math.ceil(self.p.height / self.redraw.tile_height)
-        self.cols = math.ceil(self.p.width / self.redraw.tile_width)
+
+        if self.tiling_mode == "Fourths (2x2)":
+            self.rows = 2
+            self.cols = 2
+            self.scale_factor = 1 # No global scaling
+            self.scales = []
+        elif self.tiling_mode == "Sixths (2x3)":
+            self.rows = 3
+            self.cols = 2
+            self.scale_factor = 1 # No global scaling
+            self.scales = []
+        else: # Manual mode
+            self.rows = math.ceil(self.p.height / self.redraw.tile_height)
+            self.cols = math.ceil(self.p.width / self.redraw.tile_width)
+            self.scale_factor = math.ceil(max(p.width, p.height) / max(image.width, image.height))
 
     def get_factor(self, num):
         # Its just return, don't need elif
@@ -52,6 +65,11 @@ class USDUpscaler():
         return 0
 
     def get_factors(self):
+        # This function is only relevant for Manual mode if scale_factor > 1
+        if self.tiling_mode != "Manual" or self.scale_factor <= 1:
+            self.scales = [] # Ensure scales is empty if not used
+            return
+
         scales = []
         current_scale = 1
         current_scale_factor = self.get_factor(self.scale_factor)
@@ -67,30 +85,62 @@ class USDUpscaler():
         self.scales = enumerate(scales)
 
     def upscale(self):
-        # Log info
-        print(f"Canva size: {self.p.width}x{self.p.height}")
-        print(f"Image size: {self.image.width}x{self.image.height}")
-        print(f"Scale factor: {self.scale_factor}")
-        # Check upscaler is not empty
+        # This method should only run if tiling_mode is "Manual"
+        # and there's a need to upscale (e.g. upscaler is not None and scale_factor > 1)
+        if self.tiling_mode != "Manual":
+            print(f"Tiling mode is {self.tiling_mode}, skipping global upscale.")
+            return
+
+        # Log info for manual upscale
+        print(f"Manual Upscale - Canva size: {self.p.width}x{self.p.height}")
+        print(f"Manual Upscale - Image size: {self.image.width}x{self.image.height}")
+        print(f"Manual Upscale - Scale factor: {self.scale_factor}")
+
         if self.upscaler.name == "None":
             self.image = self.image.resize((self.p.width, self.p.height), resample=Image.LANCZOS)
+            print("Manual Upscale - No upscaler selected, resized to target dimensions.")
             return
-        # Get list with scale factors
+
+        self.get_factors() # Calculate factors only if we are upscaling
+
+        if not list(self.scales): # Re-check scales after get_factors
+            print("Manual Upscale - No scaling factors determined, image might already be at target size or configuration issue.")
+            # Still resize to p.width and p.height to ensure consistency
+            self.image = self.image.resize((self.p.width, self.p.height), resample=Image.LANCZOS)
+            return
+
+        # Reset scales to be iterable again if it was checked
         self.get_factors()
+
         # Upscaling image over all factors
         for index, value in self.scales:
-            print(f"Upscaling iteration {index+1} with scale factor {value}")
+            print(f"Manual Upscale - Upscaling iteration {index+1} with scale factor {value}")
             self.image = self.upscaler.scaler.upscale(self.image, value, self.upscaler.data_path)
-        # Resize image to set values
-        self.image = self.image.resize((self.p.width, self.p.height), resample=Image.LANCZOS)
+
+        # Resize image to set values if p.width and p.height are different from upscaled image
+        if self.image.width != self.p.width or self.image.height != self.p.height:
+            self.image = self.image.resize((self.p.width, self.p.height), resample=Image.LANCZOS)
+            print("Manual Upscale - Resized to final target dimensions.")
 
     def setup_redraw(self, redraw_mode, padding, mask_blur):
-        self.redraw.mode = USDUMode(redraw_mode)
-        self.redraw.enabled = self.redraw.mode != USDUMode.NONE
-        self.redraw.padding = padding
-        self.p.mask_blur = mask_blur
+        if self.tiling_mode == "Fourths (2x2)" or self.tiling_mode == "Sixths (2x3)":
+            self.redraw.mode = USDUMode.LINEAR # Force Linear mode
+            self.redraw.enabled = True # Ensure redraw is enabled
+            print(f"Tiling mode {self.tiling_mode}: Redraw mode forced to Linear.")
+        else:
+            self.redraw.mode = USDUMode(redraw_mode)
+            self.redraw.enabled = self.redraw.mode != USDUMode.NONE
+
+        self.redraw.padding = padding # Padding might still be relevant for tile processing setup
+        self.p.mask_blur = mask_blur # Mask blur for main processing, if any
 
     def setup_seams_fix(self, padding, denoise, mask_blur, width, mode):
+        if self.tiling_mode == "Fourths (2x2)" or self.tiling_mode == "Sixths (2x3)":
+            self.seams_fix.enabled = False
+            print(f"Tiling mode {self.tiling_mode}: Seams fix disabled.")
+            # No need to set other seam_fix properties as it's disabled
+            return
+
         self.seams_fix.padding = padding
         self.seams_fix.denoise = denoise
         self.seams_fix.mask_blur = mask_blur
@@ -132,10 +182,10 @@ class USDUpscaler():
 
     def process(self):
         state.begin()
-        self.calc_jobs_count()
+        # self.calc_jobs_count() # job_count will be handled differently by redraw methods
         self.result_images = []
         if self.redraw.enabled:
-            self.image = self.redraw.start(self.p, self.image, self.rows, self.cols)
+            self.image = self.redraw.start(self.p, self.image, self.rows, self.cols, self.tiling_mode)
             self.initial_info = self.redraw.initial_info
         self.result_images.append(self.image)
         if self.redraw.save:
@@ -160,7 +210,147 @@ class USDURedraw():
         draw = ImageDraw.Draw(mask)
         return mask, draw
 
-    def calc_rectangle(self, xi, yi):
+    def linear_process(self, p: StableDiffusionProcessing, image: Image.Image, rows: int, cols: int, tiling_mode: str):
+        if tiling_mode == "Manual":
+            # Original linear_process logic for Manual mode
+            print(f"Executing original linear_process for Manual mode.")
+            state.job_count = rows * cols # As originally implicitly handled
+            mask, draw = self.init_draw(p, image.width, image.height)
+            for yi in range(rows):
+                for xi in range(cols):
+                    if state.interrupted:
+                        break
+
+                    # Calculate crop region for manual mode (usually full tile)
+                    # The existing self.calc_rectangle might be based on p.width/p.height, ensure it's correct for image
+                    # For manual mode, self.tile_width and self.tile_height are from UI
+                    crop_x1 = xi * self.tile_width
+                    crop_y1 = yi * self.tile_height
+                    crop_x2 = crop_x1 + self.tile_width
+                    crop_y2 = crop_y1 + self.tile_height
+
+                    draw.rectangle((crop_x1, crop_y1, crop_x2, crop_y2), fill="white")
+                    p.init_images = [image]
+                    p.image_mask = mask
+                    # p.width and p.height for process_images are set by init_draw
+
+                    processed = processing.process_images(p)
+                    state.job_no += 1
+
+                    draw.rectangle((crop_x1, crop_y1, crop_x2, crop_y2), fill="black")
+                    if processed and processed.images:
+                        image = processed.images[0]
+                if state.interrupted:
+                    break
+
+            if processed: # Ensure processed is defined
+                 self.initial_info = processed.infotext(p, 0)
+            # Restore p.width and p.height to original target for the final image
+            # This is implicitly handled as image is modified in place.
+
+            return image
+        elif tiling_mode == "Fourths (2x2)" or tiling_mode == "Sixths (2x3)":
+            print(f"Executing new linear_process for tiling_mode: {tiling_mode}.")
+            overall_target_width = p.width
+            overall_target_height = p.height
+            final_image_canvas = Image.new("RGB", (overall_target_width, overall_target_height))
+
+            state.job_count = rows * cols
+            state.job_no = 0
+            processed_info_text = None
+
+            for yi in range(rows):
+                for xi in range(cols):
+                    if state.interrupted:
+                        break
+
+                    # tile_width and tile_height for cropping are from USDUpscaler, based on init_img dimensions
+                    crop_x1 = xi * self.tile_width
+                    crop_y1 = yi * self.tile_height
+                    crop_x2 = min(crop_x1 + self.tile_width, image.width) # Ensure crop doesn't exceed image bounds
+                    crop_y2 = min(crop_y1 + self.tile_height, image.height)
+
+                    if crop_x1 >= image.width or crop_y1 >= image.height:
+                        print(f"Skipping tile ({xi},{yi}) as crop start is outside image bounds.")
+                        continue
+
+                    current_tile_original_image = image.crop((crop_x1, crop_y1, crop_x2, crop_y2))
+
+                    if current_tile_original_image.width == 0 or current_tile_original_image.height == 0:
+                        print(f"Skipping tile ({xi},{yi}) as cropped image has zero dimension.")
+                        continue
+
+                    p.init_images = [current_tile_original_image]
+                    p.image_mask = None # No mask for direct img2img on tiles
+                    p.inpainting_fill = 1 # Standard for img2img
+                    p.inpaint_full_res_padding = 0 # No padding for this mode
+
+                    tile_output_width = overall_target_width // cols
+                    tile_output_height = overall_target_height // rows
+
+                    # Adjust for last tile if not perfectly divisible
+                    if xi == cols - 1:
+                        tile_output_width = overall_target_width - (xi * (overall_target_width // cols))
+                    if yi == rows - 1:
+                        tile_output_height = overall_target_height - (yi * (overall_target_height // rows))
+
+                    p.width = tile_output_width
+                    p.height = tile_output_height
+
+                    print(f"Processing tile ({xi},{yi}): Crop from ({crop_x1},{crop_y1})-({crop_x2},{crop_y2}), Output Size ({tile_output_width}x{tile_output_height})")
+
+                    # Preserve original settings that might be changed by process_images
+                    original_sampler_name = p.sampler_name
+                    original_cfg_scale = p.cfg_scale
+                    original_denoising_strength = p.denoising_strength
+
+                    # TODO: Determine if specific settings for tile processing are needed
+                    # For now, use the main p settings.
+
+                    processed = processing.process_images(p)
+                    state.job_no += 1
+
+                    # Restore settings if they were changed
+                    p.sampler_name = original_sampler_name
+                    p.cfg_scale = original_cfg_scale
+                    p.denoising_strength = original_denoising_strength
+
+
+                    if processed and processed.images and processed.images[0] is not None:
+                        processed_tile_image = processed.images[0]
+                        if processed_tile_image.size != (tile_output_width, tile_output_height):
+                            print(f"Resizing processed tile from {processed_tile_image.size} to ({tile_output_width},{tile_output_height})")
+                            processed_tile_image = processed_tile_image.resize((tile_output_width, tile_output_height), Image.LANCZOS)
+
+                        paste_x = xi * (overall_target_width // cols)
+                        paste_y = yi * (overall_target_height // rows)
+                        final_image_canvas.paste(processed_tile_image, (paste_x, paste_y))
+                        if processed.infotexts and len(processed.infotexts) > 0:
+                           processed_info_text = processed.infotexts[0] # Store info from last tile
+                    else:
+                        print(f"Warning: Tile ({xi},{yi}) processing returned no image. Pasting black.")
+                        # Optionally, paste the cropped original tile or a placeholder
+                        black_tile = Image.new("RGB", (tile_output_width, tile_output_height), "black")
+                        paste_x = xi * (overall_target_width // cols)
+                        paste_y = yi * (overall_target_height // rows)
+                        final_image_canvas.paste(black_tile, (paste_x, paste_y))
+
+
+                if state.interrupted:
+                    break
+
+            self.initial_info = processed_info_text if processed_info_text else "No processing info captured for tiled redraw."
+            # Restore p.width and p.height to overall target for subsequent steps (like seams fix)
+            p.width = overall_target_width
+            p.height = overall_target_height
+            return final_image_canvas
+        else:
+            # Should not happen if tiling_mode is validated earlier
+            print(f"Warning: Unknown tiling_mode '{tiling_mode}' in linear_process. Returning original image.")
+            return image
+
+
+    def calc_rectangle(self, xi, yi): # This seems to be for the old mask drawing, may not be needed for new modes
         x1 = xi * self.tile_width
         y1 = yi * self.tile_height
         x2 = xi * self.tile_width + self.tile_width
@@ -168,27 +358,7 @@ class USDURedraw():
 
         return x1, y1, x2, y2
 
-    def linear_process(self, p, image, rows, cols):
-        mask, draw = self.init_draw(p, image.width, image.height)
-        for yi in range(rows):
-            for xi in range(cols):
-                if state.interrupted:
-                    break
-                draw.rectangle(self.calc_rectangle(xi, yi), fill="white")
-                p.init_images = [image]
-                p.image_mask = mask
-                processed = processing.process_images(p)
-                draw.rectangle(self.calc_rectangle(xi, yi), fill="black")
-                if (len(processed.images) > 0):
-                    image = processed.images[0]
-
-        p.width = image.width
-        p.height = image.height
-        self.initial_info = processed.infotext(p, 0)
-
-        return image
-
-    def chess_process(self, p, image, rows, cols):
+    def chess_process(self, p, image, rows, cols): # Signature needs tiling_mode if it were to be updated
         mask, draw = self.init_draw(p, image.width, image.height)
         tiles = []
         # calc tiles colors
@@ -239,12 +409,14 @@ class USDURedraw():
 
         return image
 
-    def start(self, p, image, rows, cols):
-        self.initial_info = None
+    def start(self, p, image, rows, cols, tiling_mode): # Added tiling_mode
+        self.initial_info = None # Reset initial_info
         if self.mode == USDUMode.LINEAR:
-            return self.linear_process(p, image, rows, cols)
+            return self.linear_process(p, image, rows, cols, tiling_mode) # Pass tiling_mode
         if self.mode == USDUMode.CHESS:
-            return self.chess_process(p, image, rows, cols)
+            # TODO: chess_process would also need to be updated to handle tiling_mode
+            print("Chess mode selected but not yet updated for new tiling modes. Using original chess logic.")
+            return self.chess_process(p, image, rows, cols) # Original call, needs update for tiling_mode
 
 class USDUSeamsFix():
 
@@ -438,13 +610,29 @@ class Script(scripts.Script):
         ]
 
         redrow_modes = [
-            "Linear",
-            "Chess",
-            "None"
+            "Linear", # Index 0
+            "Chess",  # Index 1
+            "None"    # Index 2
         ]
 
-        info = gr.HTML(
-            "<p style=\"margin-bottom:0.75em\">Will upscale the image depending on the selected target size type</p>")
+        info_html = """
+        <p style="margin-bottom:0.75em">Ultimate SD Upscale processing options:</p>
+        <ul>
+            <li><b>Manual Mode</b>: Standard upscaling. Uses the global upscaler first, then redraws tiles if enabled. Tile Width/Height, Redraw Type, and Seams Fix options are respected.</li>
+            <li><b>Fourths (2x2) / Sixths (2x3) Modes</b>:
+                <ul>
+                    <li>Divides the original image into 2x2 or 2x3 sections respectively. Each section is processed independently using img2img.</li>
+                    <li>The global upscaler (the first 'Upscaler' dropdown) is <b>ignored</b> for these modes.</li>
+                    <li>Tile Width & Tile Height sliders are <b>ignored</b> (calculated automatically from original image dimensions).</li>
+                    <li>Redraw Type "Chess" is <b>incompatible</b> and will be automatically switched to "Linear".</li>
+                    <li>All "Seams Fix" options are <b>incompatible</b> and will be disabled.</li>
+                    <li>These modes are useful for applying img2img to large images piece by piece without a large initial upscale, directly targeting final dimensions.</li>
+                </ul>
+            </li>
+        </ul>
+        <p style="margin-bottom:0.75em">Ensure 'Target size type' reflects the desired final dimensions of the image.</p>
+        """
+        info = gr.HTML(info_html)
 
         with gr.Row():
             target_size_type = gr.Dropdown(label="Target size type", elem_id=f"{elem_id_prefix}_target_size_type", choices=[k for k in target_size_types], type="index",
@@ -460,6 +648,7 @@ class Script(scripts.Script):
                                 value=shared.sd_upscalers[0].name, type="index")
         with gr.Row():
             redraw_mode = gr.Dropdown(label="Type", elem_id=f"{elem_id_prefix}_redraw_mode", choices=[k for k in redrow_modes], type="index", value=next(iter(redrow_modes)))
+            tiling_mode = gr.Dropdown(label="Tiling Mode", elem_id=f"{elem_id_prefix}_tiling_mode", choices=["Manual", "Fourths (2x2)", "Sixths (2x3)"], value="Manual", type="value")
             tile_width = gr.Slider(elem_id=f"{elem_id_prefix}_tile_width", minimum=0, maximum=2048, step=64, label='Tile width', value=512)
             tile_height = gr.Slider(elem_id=f"{elem_id_prefix}_tile_height", minimum=0, maximum=2048, step=64, label='Tile height', value=0)
             mask_blur = gr.Slider(elem_id=f"{elem_id_prefix}_mask_blur", label='Mask blur', minimum=0, maximum=64, step=1, value=8)
@@ -507,6 +696,18 @@ class Script(scripts.Script):
             outputs=[custom_width, custom_height, custom_scale]
         )
 
+        def select_tiling_mode(tiling_mode_value):
+            if tiling_mode_value == "Manual":
+                return gr.update(interactive=True), gr.update(interactive=True)
+            else:
+                return gr.update(interactive=False), gr.update(interactive=False)
+
+        tiling_mode.change(
+            fn=select_tiling_mode,
+            inputs=tiling_mode,
+            outputs=[tile_width, tile_height]
+        )
+
         def init_field(scale_name):
             try:
                 scale_index = target_size_types.index(scale_name)
@@ -517,11 +718,11 @@ class Script(scripts.Script):
 
         target_size_type.init_field = init_field
 
-        return [info, tile_width, tile_height, mask_blur, padding, seams_fix_width, seams_fix_denoise, seams_fix_padding,
+        return [info, tiling_mode, tile_width, tile_height, mask_blur, padding, seams_fix_width, seams_fix_denoise, seams_fix_padding,
                 upscaler_index, save_upscaled_image, redraw_mode, save_seams_fix_image, seams_fix_mask_blur,
                 seams_fix_type, target_size_type, custom_width, custom_height, custom_scale]
 
-    def run(self, p, _, tile_width, tile_height, mask_blur, padding, seams_fix_width, seams_fix_denoise, seams_fix_padding,
+    def run(self, p, _, tiling_mode, tile_width, tile_height, mask_blur, padding, seams_fix_width, seams_fix_denoise, seams_fix_padding,
             upscaler_index, save_upscaled_image, redraw_mode, save_seams_fix_image, seams_fix_mask_blur,
             seams_fix_type, target_size_type, custom_width, custom_height, custom_scale):
 
@@ -553,13 +754,56 @@ class Script(scripts.Script):
             p.width = math.ceil((init_img.width * custom_scale) / 64) * 64
             p.height = math.ceil((init_img.height * custom_scale) / 64) * 64
 
+        # Determine tile width and height based on tiling_mode
+        current_tile_width = tile_width
+        current_tile_height = tile_height
+
+        if tiling_mode == "Fourths (2x2)":
+            current_tile_width = init_img.width // 2
+            current_tile_height = init_img.height // 2
+        elif tiling_mode == "Sixths (2x3)":
+            current_tile_width = init_img.width // 2
+            current_tile_height = init_img.height // 3
+
+        # Ensure tile dimensions are not zero
+        if current_tile_width == 0:
+            current_tile_width = init_img.width
+        if current_tile_height == 0:
+            current_tile_height = init_img.height
+
+
         # Upscaling
-        upscaler = USDUpscaler(p, init_img, upscaler_index, save_upscaled_image, save_seams_fix_image, tile_width, tile_height)
-        upscaler.upscale()
+        upscaler = USDUpscaler(p, init_img, upscaler_index, save_upscaled_image, save_seams_fix_image, current_tile_width, current_tile_height, tiling_mode)
+
+        if tiling_mode == "Manual":
+            upscaler.upscale()
+        else:
+            # For "Fourths" or "Sixths", upscale() is skipped.
+            # Ensure p.width and p.height are set to the init_img dimensions if no upscaling is done
+            # or if the target dimensions are meant to be the original image dimensions for tiling.
+            # This depends on how p.width and p.height are used by redraw.
+            # For now, we assume p.width and p.height are the FINAL target canvas size.
+            # The redraw process will use init_img as its base.
+            print(f"Tiling mode is {tiling_mode}, global upscale skipped. Tiles will be processed on original image sized {init_img.width}x{init_img.height}.")
+            # If target_size_type was 'Custom size' or 'Scale from image size', p.width/p.height might be different
+            # from init_img.width/height. Redraw process needs to handle this.
+            # USDUpscaler.image is already init_img.
+            pass # upscale() is intentionally skipped
+
+        # Override redraw_mode and seams_fix_type for Fourths/Sixths if incompatible
+        if tiling_mode == "Fourths (2x2)" or tiling_mode == "Sixths (2x3)":
+            if redraw_mode == 1: # Chess mode index
+                print("Warning: Chess redraw mode is not compatible with Fourths/Sixths tiling. Switching to Linear mode.")
+                redraw_mode = 0 # Force Linear
+
+            if seams_fix_type != 0: # Not "None"
+                print("Warning: Seams fix is not compatible with Fourths/Sixths tiling and will be disabled.")
+                # The actual disabling happens in upscaler.setup_seams_fix based on tiling_mode
+                # No need to change seams_fix_type variable here as setup_seams_fix will handle it.
         
         # Drawing
         upscaler.setup_redraw(redraw_mode, padding, mask_blur)
-        upscaler.setup_seams_fix(seams_fix_padding, seams_fix_denoise, seams_fix_mask_blur, seams_fix_width, seams_fix_type)
+        upscaler.setup_seams_fix(seams_fix_padding, seams_fix_denoise, seams_fix_mask_blur, seams_fix_width, seams_fix_type) # seams_fix_type is passed but might be ignored
         upscaler.print_info()
         upscaler.add_extra_info()
         upscaler.process()
