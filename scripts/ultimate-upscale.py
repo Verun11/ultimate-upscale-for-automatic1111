@@ -22,10 +22,11 @@ class USDUSFMode(Enum):
 
 class USDUpscaler():
 
-    def __init__(self, p, image, upscaler_index:int, save_redraw, save_seams_fix, tile_width, tile_height, tiling_mode) -> None:
+    def __init__(self, p, image, upscaler_index:int, save_redraw, save_seams_fix, tile_width, tile_height, tiling_mode, tile_processing_budget_wh: int = 1024) -> None:
         self.p:StableDiffusionProcessing = p
         self.image:Image = image
         self.tiling_mode = tiling_mode
+        self.tile_processing_budget_wh = tile_processing_budget_wh # Store the budget
         self.upscaler = shared.sd_upscalers[upscaler_index]
         self.redraw = USDURedraw()
         self.redraw.save = save_redraw
@@ -185,7 +186,36 @@ class USDUpscaler():
         # self.calc_jobs_count() # job_count will be handled differently by redraw methods
         self.result_images = []
         if self.redraw.enabled:
-            self.image = self.redraw.start(self.p, self.image, self.rows, self.cols, self.tiling_mode)
+            # This is where tile_processing_budget_wh should be passed if it's a direct Script.run parameter
+            # However, USDUpscaler doesn't currently store it. For now, let's assume it's retrieved differently if needed by redraw.
+            # For this specific task, linear_process gets it from Script.run -> USDUpscaler.process -> USDURedraw.start -> USDURedraw.linear_process
+            # So, USDUpscaler needs to pass it to USDURedraw.start.
+            # And Script.run needs to pass it to USDUpscaler (which it does by parameter, but not stored on self).
+            # Let's assume Script.run passes tile_processing_budget_wh to this method, or it's accessed from p.
+            # For now, I need to ensure it reaches self.redraw.start.
+            # This implies tile_processing_budget_wh should be a parameter to this process() method,
+            # or stored on self from __init__. The latter is cleaner.
+            # Let's assume it has been added to __init__ and self for now.
+            # If not, this is an oversight in previous steps or requires adjustment here.
+            # For the direct request, I will add it to the call for self.redraw.start.
+            # This means USDUpscaler needs tile_processing_budget_wh.
+            # It is passed to __init__ from Script.run, but not stored.
+            # It's better to store it on self in __init__.
+            # For now, just modifying the call as requested by the subtask chain.
+            # The subtask is focused on linear_process, so I'll assume tile_processing_budget_wh is available to USDUpscaler.process somehow.
+            # The current script run passes it to USDUpscaler constructor, BUT it's not stored on self.
+            # This is a gap. It should be stored on self.
+            # I will add it to the call here, assuming it will be made available to self.redraw.start
+            # This means `self.tile_processing_budget_wh` should exist.
+            # I'll add it to the call for now, and a previous step should have added it to `self`.
+            # If `tile_processing_budget_wh` is not on `self`, this will fail.
+            # The previous step added it to Script.run, so it's available there.
+            # It needs to be passed into USDUpscaler and then used.
+            # The previous step added it to ui() return and Script.run() params.
+            # It's NOT added to USDUpscaler constructor or self.
+            # This is a problem. I will have to modify USDUpscaler.__init__ as well.
+
+            self.image = self.redraw.start(self.p, self.image, self.rows, self.cols, self.tiling_mode, self.tile_processing_budget_wh) # Pass stored budget
             self.initial_info = self.redraw.initial_info
         self.result_images.append(self.image)
         if self.redraw.save:
@@ -210,7 +240,7 @@ class USDURedraw():
         draw = ImageDraw.Draw(mask)
         return mask, draw
 
-    def linear_process(self, p: StableDiffusionProcessing, image: Image.Image, rows: int, cols: int, tiling_mode: str):
+    def linear_process(self, p: StableDiffusionProcessing, image: Image.Image, rows: int, cols: int, tiling_mode: str, tile_processing_budget_wh: int): # Added tile_processing_budget_wh
         if tiling_mode == "Manual":
             # Original linear_process logic for Manual mode
             print(f"Executing original linear_process for Manual mode.")
@@ -285,19 +315,19 @@ class USDURedraw():
                     p.inpainting_fill = 1 # Standard for img2img
                     p.inpaint_full_res_padding = 0 # No padding for this mode
 
-                    tile_output_width = overall_target_width // cols
-                    tile_output_height = overall_target_height // rows
+                    # Determine the size of the slot this tile will occupy in the final image
+                    final_tile_slot_width = overall_target_width // cols
+                    final_tile_slot_height = overall_target_height // rows
+                    if xi == cols - 1: # Adjust for last column
+                        final_tile_slot_width = overall_target_width - (xi * (overall_target_width // cols))
+                    if yi == rows - 1: # Adjust for last row
+                        final_tile_slot_height = overall_target_height - (yi * (overall_target_height // rows))
 
-                    # Adjust for last tile if not perfectly divisible
-                    if xi == cols - 1:
-                        tile_output_width = overall_target_width - (xi * (overall_target_width // cols))
-                    if yi == rows - 1:
-                        tile_output_height = overall_target_height - (yi * (overall_target_height // rows))
+                    # Set p.width and p.height for the actual tile processing to the budget
+                    p.width = tile_processing_budget_wh
+                    p.height = tile_processing_budget_wh
 
-                    p.width = tile_output_width
-                    p.height = tile_output_height
-
-                    print(f"Processing tile ({xi},{yi}): Crop from ({crop_x1},{crop_y1})-({crop_x2},{crop_y2}), Output Size ({tile_output_width}x{tile_output_height})")
+                    print(f"Processing tile ({xi},{yi}): Crop from ({crop_x1},{crop_y1})-({crop_x2},{crop_y2}), Process Budget ({p.width}x{p.height}), Target Slot Size ({final_tile_slot_width}x{final_tile_slot_height})")
 
                     # Preserve original settings that might be changed by process_images
                     original_sampler_name = p.sampler_name
@@ -318,22 +348,26 @@ class USDURedraw():
 
                     if processed and processed.images and processed.images[0] is not None:
                         processed_tile_image = processed.images[0]
-                        if processed_tile_image.size != (tile_output_width, tile_output_height):
-                            print(f"Resizing processed tile from {processed_tile_image.size} to ({tile_output_width},{tile_output_height})")
-                            processed_tile_image = processed_tile_image.resize((tile_output_width, tile_output_height), Image.LANCZOS)
 
-                        paste_x = xi * (overall_target_width // cols)
+                        # Resize the processed tile (which is at tile_processing_budget_wh resolution) to fit the final_tile_slot_width/height
+                        if processed_tile_image.size != (final_tile_slot_width, final_tile_slot_height):
+                            print(f"Resizing processed tile from {processed_tile_image.size} to ({final_tile_slot_width},{final_tile_slot_height}) for pasting.")
+                            processed_tile_image = processed_tile_image.resize((final_tile_slot_width, final_tile_slot_height), Image.LANCZOS)
+
+                        paste_x = xi * (overall_target_width // cols) # Paste coordinates are based on slot sizes
                         paste_y = yi * (overall_target_height // rows)
-                        final_image_canvas.paste(processed_tile_image, (paste_x, paste_y))
+                        # Ensure paste coordinates are integers
+                        final_image_canvas.paste(processed_tile_image, (int(paste_x), int(paste_y)))
                         if processed.infotexts and len(processed.infotexts) > 0:
                            processed_info_text = processed.infotexts[0] # Store info from last tile
                     else:
-                        print(f"Warning: Tile ({xi},{yi}) processing returned no image. Pasting black.")
-                        # Optionally, paste the cropped original tile or a placeholder
-                        black_tile = Image.new("RGB", (tile_output_width, tile_output_height), "black")
+                        print(f"Warning: Tile ({xi},{yi}) processing returned no image. Pasting black placeholder sized to slot.")
+                        # Optionally, paste the cropped original tile or a placeholder, resized to slot.
+                        black_tile = Image.new("RGB", (final_tile_slot_width, final_tile_slot_height), "black")
                         paste_x = xi * (overall_target_width // cols)
                         paste_y = yi * (overall_target_height // rows)
-                        final_image_canvas.paste(black_tile, (paste_x, paste_y))
+                        # Ensure paste coordinates are integers
+                        final_image_canvas.paste(black_tile, (int(paste_x), int(paste_y)))
 
 
                 if state.interrupted:
@@ -409,13 +443,13 @@ class USDURedraw():
 
         return image
 
-    def start(self, p, image, rows, cols, tiling_mode): # Added tiling_mode
+    def start(self, p, image, rows, cols, tiling_mode, tile_processing_budget_wh: int): # Added budget param, removed default
         self.initial_info = None # Reset initial_info
         if self.mode == USDUMode.LINEAR:
-            return self.linear_process(p, image, rows, cols, tiling_mode) # Pass tiling_mode
+            return self.linear_process(p, image, rows, cols, tiling_mode, tile_processing_budget_wh) # Pass budget
         if self.mode == USDUMode.CHESS:
-            # TODO: chess_process would also need to be updated to handle tiling_mode
-            print("Chess mode selected but not yet updated for new tiling modes. Using original chess logic.")
+            # TODO: chess_process would also need to be updated to handle tiling_mode and budget
+            print("Chess mode selected but not yet updated for new tiling modes or budget. Using original chess logic.")
             return self.chess_process(p, image, rows, cols) # Original call, needs update for tiling_mode
 
 class USDUSeamsFix():
@@ -624,6 +658,7 @@ class Script(scripts.Script):
                     <li>Divides the original image into 2x2 or 2x3 sections respectively. Each section is processed independently using img2img.</li>
                     <li>The global upscaler (the first 'Upscaler' dropdown) is <b>ignored</b> for these modes.</li>
                     <li>Tile Width & Tile Height sliders are <b>ignored</b> (calculated automatically from original image dimensions).</li>
+                    <li>The <b>"Tile Processing Budget (W/H)"</b> slider (visible only in these modes) defines the resolution at which each tile is processed by img2img before being resized to fit its place in the final image. Higher values mean more detail per tile but slower processing.</li>
                     <li>Redraw Type "Chess" is <b>incompatible</b> and will be automatically switched to "Linear".</li>
                     <li>All "Seams Fix" options are <b>incompatible</b> and will be disabled.</li>
                     <li>These modes are useful for applying img2img to large images piece by piece without a large initial upscale, directly targeting final dimensions.</li>
@@ -649,8 +684,9 @@ class Script(scripts.Script):
         with gr.Row():
             redraw_mode = gr.Dropdown(label="Type", elem_id=f"{elem_id_prefix}_redraw_mode", choices=[k for k in redrow_modes], type="index", value=next(iter(redrow_modes)))
             tiling_mode = gr.Dropdown(label="Tiling Mode", elem_id=f"{elem_id_prefix}_tiling_mode", choices=["Manual", "Fourths (2x2)", "Sixths (2x3)"], value="Manual", type="value")
-            tile_width = gr.Slider(elem_id=f"{elem_id_prefix}_tile_width", minimum=0, maximum=2048, step=64, label='Tile width', value=512)
-            tile_height = gr.Slider(elem_id=f"{elem_id_prefix}_tile_height", minimum=0, maximum=2048, step=64, label='Tile height', value=0)
+            tile_width = gr.Slider(elem_id=f"{elem_id_prefix}_tile_width", minimum=0, maximum=2048, step=64, label='Tile width (Manual only)', value=512)
+            tile_height = gr.Slider(elem_id=f"{elem_id_prefix}_tile_height", minimum=0, maximum=2048, step=64, label='Tile height (Manual only)', value=0)
+            tile_processing_budget_wh = gr.Slider(label="Tile Processing Budget (W/H)", elem_id=f"{elem_id_prefix}_tile_processing_budget_wh", minimum=256, maximum=2048, step=64, value=1024, visible=False, interactive=False)
             mask_blur = gr.Slider(elem_id=f"{elem_id_prefix}_mask_blur", label='Mask blur', minimum=0, maximum=64, step=1, value=8)
             padding = gr.Slider(elem_id=f"{elem_id_prefix}_padding", label='Padding', minimum=0, maximum=512, step=1, value=32)
         gr.HTML("<p style=\"margin-bottom:0.75em\">Seams fix:</p>")
@@ -697,15 +733,17 @@ class Script(scripts.Script):
         )
 
         def select_tiling_mode(tiling_mode_value):
-            if tiling_mode_value == "Manual":
-                return gr.update(interactive=True), gr.update(interactive=True)
-            else:
-                return gr.update(interactive=False), gr.update(interactive=False)
+            is_manual = tiling_mode_value == "Manual"
+            return [
+                gr.update(interactive=is_manual),  # tile_width
+                gr.update(interactive=is_manual),  # tile_height
+                gr.update(visible=not is_manual, interactive=not is_manual)  # tile_processing_budget_wh
+            ]
 
         tiling_mode.change(
             fn=select_tiling_mode,
             inputs=tiling_mode,
-            outputs=[tile_width, tile_height]
+            outputs=[tile_width, tile_height, tile_processing_budget_wh]
         )
 
         def init_field(scale_name):
@@ -718,11 +756,11 @@ class Script(scripts.Script):
 
         target_size_type.init_field = init_field
 
-        return [info, tiling_mode, tile_width, tile_height, mask_blur, padding, seams_fix_width, seams_fix_denoise, seams_fix_padding,
+        return [info, tiling_mode, tile_width, tile_height, tile_processing_budget_wh, mask_blur, padding, seams_fix_width, seams_fix_denoise, seams_fix_padding,
                 upscaler_index, save_upscaled_image, redraw_mode, save_seams_fix_image, seams_fix_mask_blur,
                 seams_fix_type, target_size_type, custom_width, custom_height, custom_scale]
 
-    def run(self, p, _, tiling_mode, tile_width, tile_height, mask_blur, padding, seams_fix_width, seams_fix_denoise, seams_fix_padding,
+    def run(self, p, _, tiling_mode, tile_width, tile_height, tile_processing_budget_wh, mask_blur, padding, seams_fix_width, seams_fix_denoise, seams_fix_padding,
             upscaler_index, save_upscaled_image, redraw_mode, save_seams_fix_image, seams_fix_mask_blur,
             seams_fix_type, target_size_type, custom_width, custom_height, custom_scale):
 
@@ -773,7 +811,7 @@ class Script(scripts.Script):
 
 
         # Upscaling
-        upscaler = USDUpscaler(p, init_img, upscaler_index, save_upscaled_image, save_seams_fix_image, current_tile_width, current_tile_height, tiling_mode)
+        upscaler = USDUpscaler(p, init_img, upscaler_index, save_upscaled_image, save_seams_fix_image, current_tile_width, current_tile_height, tiling_mode, tile_processing_budget_wh)
 
         if tiling_mode == "Manual":
             upscaler.upscale()
