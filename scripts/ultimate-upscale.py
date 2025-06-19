@@ -138,7 +138,7 @@ class USDUpscaler():
         if self.tiling_mode == "Fourths (2x2)" or self.tiling_mode == "Sixths (2x3)":
             self.seams_fix.enabled = False
             print(f"Tiling mode {self.tiling_mode}: Seams fix disabled.")
-            # No need to set other seam_fix properties as it's disabled
+            self.seams_fix.mode = USDUSFMode.NONE # Ensure mode is initialized
             return
 
         self.seams_fix.padding = padding
